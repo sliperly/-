@@ -28,6 +28,7 @@ import shutil
 import sys
 import json
 import argparse
+import platform
 from pathlib import Path
 from datetime import datetime
 
@@ -36,6 +37,22 @@ try:
 except ImportError:
     print(json.dumps({"status": "error", "message": "Не установлен openpyxl. Установите: pip install openpyxl"}, ensure_ascii=False))
     sys.exit(1)
+
+
+def long_path(p: Path) -> str:
+    """
+    Обходит ограничение Windows в 260 символов на длину пути.
+    Без этого shutil.move падает с FileNotFoundError на глубоко
+    вложенных категориях, хотя папка реально существует.
+    """
+    if platform.system() != "Windows":
+        return str(p)
+    resolved = str(p.resolve())
+    if resolved.startswith("\\\\?\\"):
+        return resolved
+    if resolved.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + resolved.lstrip("\\")
+    return "\\\\?\\" + resolved
 
 # --- Конфигурация путей ---
 # ТЕСТОВЫЙ РЕЖИМ: локальная песочница вместо боевых сетевых папок.
@@ -65,6 +82,14 @@ CODE_COLUMN = 2
 # заголовок, а не код (обычно название лежит в том же или соседнем столбце).
 NAME_COLUMN = 5
 
+# Верхний уровень группировки Excel (outline level), который НЕ должен
+# превращаться в папку на диске. В Структура.xlsx на этом уровне лежит
+# служебный корневой узел "Товары" — он общий для всего прайс-листа и
+# на диске ему соответствия нет (папки категорий уровня 1С сразу лежат
+# в GotovayaNomenklatura). Если структура прайс-листа изменится и
+# появится другой лишний "потолочный" уровень — поменяйте значение здесь.
+ROOT_LEVEL_TO_SKIP = 0
+
 
 def build_category_map(xlsx_path: Path) -> dict[str, str]:
     """Строит {код: относительный_путь_категории} по группировке Excel."""
@@ -82,8 +107,13 @@ def build_category_map(xlsx_path: Path) -> dict[str, str]:
 
         if match:
             # строка с кодом номенклатуры — собрать путь из всех родительских
-            # заголовков (уровни строго меньше текущего)
-            path_parts = [stack[lvl] for lvl in sorted(stack) if lvl < level]
+            # заголовков (уровни строго меньше текущего), кроме служебного
+            # корневого уровня ROOT_LEVEL_TO_SKIP ("Товары") — ему не должно
+            # быть соответствия в виде папки на диске.
+            path_parts = [
+                stack[lvl] for lvl in sorted(stack)
+                if ROOT_LEVEL_TO_SKIP < lvl < level
+            ]
             mapping[match.group(1)] = "/".join(path_parts) if path_parts else "Без категории"
         else:
             # заголовок категории — обновить стек, сбросить более глубокие уровни
@@ -127,6 +157,8 @@ def main():
     for file in sorted(SOURCE.iterdir()):
         if not file.is_file():
             continue
+        if file.name.lower() == "desktop.ini":
+            continue  # служебный файл Windows, не номенклатура — молча пропустить
 
         match = CODE_PATTERN.match(file.name)
         if not match:
@@ -141,17 +173,21 @@ def main():
             continue
 
         target_dir = DEST / category_path
+        if not Path(long_path(target_dir)).exists():
+            issues.append((file.name, f"папка категории ещё не создана на диске: {category_path}"))
+            continue
+
         target_file = target_dir / file.name
-        replaced = target_file.exists()
+        target_file_lp = long_path(target_file)
+        replaced = Path(target_file_lp).exists()
 
         if args.dry_run:
             transferred.append((file.name, str(target_file.relative_to(DEST)), "ЗАМЕНА" if replaced else "новый"))
             continue
 
-        target_dir.mkdir(parents=True, exist_ok=True)
         if replaced:
-            target_file.unlink()
-        shutil.move(str(file), str(target_file))
+            Path(target_file_lp).unlink()
+        shutil.move(long_path(file), target_file_lp)
         transferred.append((file.name, str(target_file.relative_to(DEST)), "ЗАМЕНА" if replaced else "новый"))
 
     if args.dry_run:
